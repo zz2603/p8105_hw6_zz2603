@@ -11,6 +11,8 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(modelr)
 library(mgcv)
+library(ggpubr)
+library(Hmisc)
 
 ```
 
@@ -18,16 +20,190 @@ library(mgcv)
 ```{r}
 birthwt <- read_csv("./data/birthweight.csv")
 
+## check for NA
+nalst <- vector("list",dim(birthwt)[2])
+nalst = map(birthwt,is.na) %>% map(sum)
+unlist(nalst) %>% as.vector()
+```
 
+There is no missing values in the dataset.
+
+```{r}
+## transfer babysex, frace, malform, mrace into factor
+cln_bthwt <- birthwt %>% 
+  mutate(babysex = as.factor(babysex),
+         babysex = fct_relevel(babysex,"1"),
+         frace = as.factor(frace),
+         frace = fct_relevel(frace,"1"),
+         malform = as.factor(malform),
+         malform = fct_relevel(malform,"0"),
+         mrace = as.factor(mrace),
+         mrace = fct_relevel(mrace,"1"))
+```
+
+I want to see how each variable is correlated with birth weight and then decide which variable to use in the model. 
+
+```{r fig.height=18,fig.width=20}
+babybwt <- cln_bthwt[[4]]
+
+crt_corr <- function(x) {
+  cln_bthwt %>% ggplot(aes(y=bwt,x=x))+
+    geom_point(alpha=0.1)+
+    stat_smooth(method = "lm")+
+    stat_cor(method="pearson")
+}
+
+corr_plotlst <- vector("list",dim(cln_bthwt)[2])
+corr_plotlst <- map(cln_bthwt,crt_corr)
+
+ggarrange(plotlist = corr_plotlst,widths = c(4,5))
 
 ```
 
-## Including Plots
+Based on scatterplots, I found out that variables bhead, blength, delwt, fincome, gaweeks, mheight, momage, ppbmi, ppwt, smoken, and wtgain are significantly correlated in the model with outcome of bwt.
 
-You can also embed plots, for example:
+I also want to see how every continuous variable is correlated with each other. We remove variable pnumsga and pnumlbw because there is only one values 0.
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r}
+cont_bthbwt <- cln_bthwt %>% 
+  select(bhead, blength, bwt, delwt, fincome, gaweeks, menarche,
+         mheight, momage, parity, ppbmi, ppwt, smoken, wtgain)
+
+Hmisc::rcorr(as.matrix(cont_bthbwt)) ## see correlation and p-value
+
+## see it visually
+cor(cont_bthbwt) %>% corrplot::corrplot()
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+From the plot, we can find out several pairs of variables are highly correlated,such as pairs of variable bmi and weights, and pairs of head size and length.
+
+Let's see hypothesized structure of model of birthweight. According to my brief review of literature and websites, I found that baby's sex, parental race, mother's pre-pregnancy bmi (or weight), and gestational age can affect birthweight.
+
+Since it will take too much time and effort to do variable selection or random forest test, I will combine the results from basic correlation analysis and hypothesize structure. 
+
+Proposed model: babysex, blength, gaweeks, mrace, and ppbmi.
+
+```{r}
+prop_df <- cln_bthwt %>% 
+  select(bwt,babysex,blength,gaweeks,mrace,ppbmi) %>% 
+  mutate(id = c(1:dim(cln_bthwt)[1]))
+ 
+train_df <- sample_frac(prop_df,0.8)
+test_df <- anti_join(prop_df, train_df, by="id")
+
+linear_mod = lm(bwt~babysex+blength+gaweeks+mrace+ppbmi,data=train_df)
+
+linear_pred = add_predictions(train_df,linear_mod) %>% pull(pred)
+linear_resid = add_residuals(train_df,linear_mod) %>% pull(resid)
+
+pred_resid = tibble(linear_pred,linear_resid)
+
+ggplot(pred_resid,aes(y=linear_resid,x=linear_pred))+
+  geom_point()+stat_smooth()
+
+```
+
+I may propose a wrong model.
+
+```{r}
+
+cv_df = crossv_mc(cln_bthwt,100,test=0.2) %>% 
+  mutate(train=map(train,as_tibble),
+         test=map(test,as_tibble)) %>% 
+  mutate(prop_mod = map(train,
+                        ~lm(bwt~babysex+blength+gaweeks+mrace+ppbmi,
+                            data = .x)),
+         first_mod = map(train,~lm(bwt~blength+gaweeks,data=.x)),
+         second_mod = map(train,
+                          ~lm(bwt~bhead+blength+babysex+bhead*blength+
+                                 bhead*babysex+blength*babysex+
+                                 bhead*blength*babysex,data=.x))) %>%
+  mutate(rmse_prop = map2_dbl(prop_mod,test,~rmse(model=.x,data=.y)),
+         rmse_first = map2_dbl(first_mod,test,~rmse(model=.x,data=.y)),
+         rmse_second = map2_dbl(second_mod,test,~rmse(model=.x,data=.y)))
+
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(everything(),
+    names_to = "model",
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model=fct_inorder(model)) %>% 
+  ggplot(aes(x=model,y=rmse))+geom_violin()
+
+```
+
+I don't think I fit correct model. I should fit smooth model here, but it returned error.
+
+# Problem 2
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+
+## create a plot
+weather_df %>% ggplot(aes(y=tmax,x=tmin))+
+  geom_point(alpha=0.5)+stat_smooth(method = "lm")
+
+## fit model
+lm(tmax~tmin,data=weather_df) %>% broom::tidy() %>% knitr::kable(digits = 3)
+
+## create 5000 bootstrap samples
+boot_strap = weather_df %>% bootstrap(n=5000)
+
+## get estimate R-square
+boot_strap %>% mutate(models = map(strap,~lm(tmax~tmin,data=.x)),
+                      results = map(models,broom::glance))%>% 
+  select(-strap,-models) %>% 
+  unnest(results) %>% janitor::clean_names() %>% 
+  pull(r_squared) %>% as.vector() %>% 
+  quantile(probs=c(0.025, 0.975), na.rm=TRUE)
+
+## make plot for estimate r-square
+boot_strap %>% mutate(models = map(strap,~lm(tmax~tmin,data=.x)),
+                      results = map(models,broom::glance))%>% 
+  select(-strap,-models) %>% 
+  unnest(results) %>% janitor::clean_names() %>% 
+  ggplot(aes(x=r_squared))+geom_density()
+
+```
+
+From the density plot, r-squared values are skewed to left.
+
+```{r}
+## get log(beta_hat0*beta_hat1)
+beta_df <- boot_strap %>% mutate(models = map(strap,~lm(tmax~tmin,data=.x)),
+                      results = map(models,broom::tidy)) %>% 
+  select(-strap,-models) %>% 
+  unnest(results) %>% 
+  select(term,estimate) %>% 
+  pivot_wider(names_from = "term",
+              values_from = "estimate")
+
+beta0hat <- beta_df[[1]] %>% unlist()
+beta1hat <- beta_df[[2]] %>% unlist()
+
+betahat_df <- tibble(beta0hat,beta1hat,log_betahat = log(beta0hat*beta1hat))
+
+pull(betahat_df,log_betahat) %>% as.vector() %>% 
+  quantile(probs=c(0.025, 0.975), na.rm=TRUE)
+
+betahat_df %>% 
+  ggplot(aes(log_betahat))+geom_density()
+```
+
+From the plot of log(beta0*beta1), the shape of density plot is balanced and symmetrics. 
+
+
+
+
+
